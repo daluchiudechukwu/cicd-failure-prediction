@@ -13,7 +13,7 @@ mentions an email") and discards the identity.
 
 **Normalisation, for tokeniser stability.** 20,149 messages contain non-ASCII
 characters and 10 contain C0 control characters. Bot-generated changelogs
-reach tens of thousands of characters. Unicode is normalised to NFC rather
+reach tens of thousands of characters. Unicode is normalised to NFKC rather
 than stripped, because CJK and accented identifiers are legitimate content;
 control characters are removed; and length is capped so a handful of records
 cannot dominate tokenisation cost.
@@ -21,7 +21,7 @@ cannot dominate tokenisation cost.
 Order is deliberate and was corrected after an audit of the output: Unicode is
 canonicalised *first*, then spans are redacted, then the text is truncated.
 
-Normalising first matters because NFC folds fullwidth and compatibility
+Normalising first matters because NFKC folds fullwidth and compatibility
 characters onto their ASCII equivalents, so `alice＠example.com` only becomes
 matchable as an email after normalisation. Redacting before normalising left 7
 addresses and 15 URLs in the processed corpus. Redacting before truncating
