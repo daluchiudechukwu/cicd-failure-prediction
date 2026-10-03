@@ -29,9 +29,17 @@ Measured on all 573,993 usable runs, the task decomposes into three regimes:
 
 Around **48% of all failures** fall in the first two regimes, where
 autocorrelation is blind and trigger-time metadata is the only remaining
-signal. That is the target of this work, and the evidence that unstructured
-text carries usable signal is already visible without any model: branch-name
-bucketing alone separates `main` (12.9% failure) from `renovate/` (27.4%).
+signal. That is the target of this work.
+
+## Feasibility is established, not assumed
+
+A gradient-boosting model over pre-execution features only, evaluated with
+5-fold repository-grouped cross-validation on all 573,993 runs, reaches
+**PR-AUC 0.701 and ROC-AUC 0.889** — 4.4× the base rate on projects it has
+never seen. Against the previous-outcome heuristic it is **+141% in the
+cold-start regime and +297% in the new-breakage regime**, the two regimes the
+heuristic cannot address at all. Full results and the reproduction commands
+are in [`docs/05-feasibility-results.md`](docs/05-feasibility-results.md).
 
 ## Approach
 
@@ -65,6 +73,7 @@ evidence instead of preference.
 | [`docs/02-feature-contract.md`](docs/02-feature-contract.md) | What may and may not enter a model, mapped field by field to the dataset JSON, including two GitHub Actions-specific leakage mechanisms |
 | [`docs/03-research-design.md`](docs/03-research-design.md) | Research gaps, questions, hypotheses, objectives, contributions, and scope exclusions |
 | [`docs/04-execution-plan.md`](docs/04-execution-plan.md) | Eight phases with exit gates, model selection, evaluation protocol, explainability study, risk register, and chapter mapping |
+| [`docs/05-feasibility-results.md`](docs/05-feasibility-results.md) | A real experiment on all 573,993 runs establishing that pre-execution prediction works, and the bar the deep models must clear |
 
 ## Reproducing the dataset profile
 
