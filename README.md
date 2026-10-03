@@ -33,13 +33,20 @@ signal. That is the target of this work.
 
 ## Feasibility is established, not assumed
 
-A gradient-boosting model over pre-execution features only, evaluated with
-5-fold repository-grouped cross-validation on all 573,993 runs, reaches
-**PR-AUC 0.701 and ROC-AUC 0.889** — 4.4× the base rate on projects it has
-never seen. Against the previous-outcome heuristic it is **+141% in the
-cold-start regime and +297% in the new-breakage regime**, the two regimes the
-heuristic cannot address at all. Full results and the reproduction commands
-are in [`docs/05-feasibility-results.md`](docs/05-feasibility-results.md).
+A gradient-boosting model over the 132 pre-execution features, evaluated with
+5-fold repository-grouped cross-validation on 567,814 runs, reaches **PR-AUC
+0.716 and ROC-AUC 0.898** — 4.5× the base rate on projects it has never seen.
+Against the previous-outcome heuristic it is **+165% in the cold-start regime
+and +356% in the new-breakage regime**, the two regimes the heuristic cannot
+address at all. Full results in
+[`docs/05-feasibility-results.md`](docs/05-feasibility-results.md).
+
+One measured constraint shapes the whole design: 69.9% of runs share a commit
+with another run, and **47.7% of all failures share a commit with a success**
+because one push triggers several workflows. Commit text alone therefore
+cannot separate nearly half the positive class — workflow identity is a
+required input, and any commit-level model has an irreducible error floor of
+6.42%.
 
 ## Approach
 
@@ -74,20 +81,37 @@ evidence instead of preference.
 | [`docs/03-research-design.md`](docs/03-research-design.md) | Research gaps, questions, hypotheses, objectives, contributions, and scope exclusions |
 | [`docs/04-execution-plan.md`](docs/04-execution-plan.md) | Eight phases with exit gates, model selection, evaluation protocol, explainability study, risk register, and chapter mapping |
 | [`docs/05-feasibility-results.md`](docs/05-feasibility-results.md) | A real experiment on all 573,993 runs establishing that pre-execution prediction works, and the bar the deep models must clear |
+| [`docs/06-data-pipeline.md`](docs/06-data-pipeline.md) | The ingestion, filtering, and feature-engineering pipeline, with the rationale behind each design decision |
 
-## Reproducing the dataset profile
+## Running the pipeline
 
 Download the two metadata files from Zenodo record
 [14796970](https://doi.org/10.5281/zenodo.10154920) — `repositories.json.gz`
-(69 MB) and `runs.json.gz` (1.06 GB). The 142 GB log archive is not required
-for the profile.
+(69 MB) and `runs.json.gz` (1.06 GB). The 142 GB log archive is not required.
 
 ```sh
+pip install -r requirements.txt
+export PYTHONPATH=src
+export GHALOGS_SALT="$(openssl rand -hex 16)"   # keep out of version control
+
+# Profile the raw dataset
 python scripts/profile_dataset.py --data-dir /path/to/ghalogs
+
+# Ingest -> filter -> engineer features (about 2m45s total on 4 cores)
+python -m ghalogs.pipeline all --data-dir /path/to/ghalogs --out-dir data
+
+# Gate: privacy, feature contract, history causality, sanity
+python scripts/audit_pipeline_output.py --features data/features.parquet
+
+# Feasibility experiment
+python scripts/run_baseline_experiment.py --features data/features.parquet
+
+python -m pytest tests/ -q
 ```
 
-Every figure quoted in this README and in `docs/01-dataset-profile.md` is
-produced by that script.
+Every figure quoted in this README and in `docs/` is output from these
+commands. See [`docs/06-data-pipeline.md`](docs/06-data-pipeline.md) for what
+each stage does and why.
 
 ## Dataset
 
