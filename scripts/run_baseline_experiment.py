@@ -41,7 +41,6 @@ from sklearn.model_selection import GroupKFold
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-CATEGORICAL = ["static_event", "static_language"]
 LABEL = "failed"
 GROUP = "repo"
 
@@ -59,9 +58,14 @@ def feature_columns(frame: pd.DataFrame, condition: str) -> list[str]:
 
 
 def prepare(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Cast non-numeric features to pandas `category` for native LightGBM support.
+
+    Detected by dtype rather than by a hard-coded list, so a new categorical
+    feature cannot be silently passed through as an object column.
+    """
     data = frame[columns].copy()
-    for column in CATEGORICAL:
-        if column in data.columns:
+    for column in data.columns:
+        if not pd.api.types.is_numeric_dtype(data[column]):
             data[column] = data[column].astype("category")
     return data
 

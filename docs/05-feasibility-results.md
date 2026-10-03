@@ -7,14 +7,19 @@ available before a run starts carry enough signal to predict failure?**
 Reproduce with:
 
 ```sh
-python scripts/extract_features.py --data-dir <ghalogs> --out data/features.parquet
+export PYTHONPATH=src; export GHALOGS_SALT="$(openssl rand -hex 16)"
+python -m ghalogs.pipeline all --data-dir <ghalogs> --out-dir data
 python scripts/run_baseline_experiment.py --features data/features.parquet
 ```
 
+Figures below are from the pipeline feature set documented in
+`docs/06-data-pipeline.md`.
+
 ## Setup
 
-- **Data:** all 573,993 usable runs (`conclusion in {success, failure}`) across
-  28,653 repositories. Failure rate 15.88%.
+- **Data:** the 567,814-run modelling population across 28,297 repositories,
+  derived by the exclusion ledger in `docs/06-data-pipeline.md`. Failure rate
+  15.87%.
 - **Model:** LightGBM, `class_weight="balanced"`, 600 trees with early stopping
   on a grouped validation slice. One model family throughout, so the
   comparison isolates the *inputs* rather than the architecture.
@@ -22,7 +27,7 @@ python scripts/run_baseline_experiment.py --features data/features.parquet
   both train and test, so these are cross-project numbers. Predictions are
   out-of-fold.
 - **Thresholds:** chosen to maximise failure-class F1 on a 20% repository slice
-  held out from reporting; all metrics below are on the remaining 459,049 runs.
+  held out from reporting; all metrics below are on the remaining 454,095 runs.
 - **Features:** only fields admitted by `docs/02-feature-contract.md`. No logs,
   no run duration, no crawl-time repository snapshots.
 
@@ -30,8 +35,8 @@ Four input conditions:
 
 | Condition | Inputs |
 | --- | --- |
-| `static` | 73 features needing no execution history: branch-name shape and keywords, commit-message shape and keywords, trigger event, hour and weekday, bot/fork/PR flags, language, repository age |
-| `hist` | 8 causally ordered history features: previous outcome, prior failure rates for the workflow and repository, hours since previous run, missingness flags |
+| `static` | 122 features needing no execution history: branch shape and keywords (28), commit-message shape and keywords (43), workflow identity (26), trigger context (16), repository context (9) |
+| `hist` | 10 causally ordered history features: previous outcome, failure streak, prior failure rates at workflow / repository / actor scope, hours since previous run, missingness flags |
 | `both` | `static` + `hist` |
 | `straw` | Copy the previous run's outcome. No training |
 
@@ -42,45 +47,47 @@ PR-AUC (average precision on the failure class) is the primary metric. The
 
 | Regime | n | Base rate | `static` | `hist` | `both` | `straw` |
 | --- | --- | --- | --- | --- | --- | --- |
-| **All** | 459,049 | 0.1591 | 0.2954 | 0.6690 | **0.7009** | 0.4876 |
-| A — cold start | 117,015 | 0.1806 | 0.3215 | 0.3565 | **0.4353** | 0.1806 |
-| B — previous run succeeded | 287,744 | 0.0496 | 0.1188 | 0.1248 | **0.1968** | 0.0496 |
-| C — previous run failed | 54,290 | 0.6933 | 0.7246 | 0.8839 | **0.8944** | 0.6933 |
+| **All** | 454,095 | 0.1588 | 0.3355 | 0.6768 | **0.7157** | 0.4886 |
+| A — cold start | 115,525 | 0.1811 | 0.3725 | 0.3711 | **0.4793** | 0.1811 |
+| B — previous run succeeded | 285,133 | 0.0493 | 0.1208 | 0.1523 | **0.2247** | 0.0493 |
+| C — previous run failed | 53,437 | 0.6950 | 0.7390 | 0.8872 | **0.8987** | 0.6950 |
 
 Expressed as lift over the base rate — how many times better than guessing:
 
 | Regime | `static` | `hist` | `both` | `straw` |
 | --- | --- | --- | --- | --- |
-| All | 1.86× | 4.20× | **4.40×** | 3.06× |
-| A — cold start | 1.78× | 1.97× | **2.41×** | 1.00× |
-| B — previous run succeeded | 2.40× | 2.52× | **3.97×** | 1.00× |
-| C — previous run failed | 1.05× | 1.28× | **1.29×** | 1.00× |
+| All | 2.11× | 4.26× | **4.51×** | 3.08× |
+| A — cold start | 2.06× | 2.05× | **2.65×** | 1.00× |
+| B — previous run succeeded | 2.45× | 3.09× | **4.56×** | 1.00× |
+| C — previous run failed | 1.06× | 1.28× | **1.29×** | 1.00× |
 
 And as the relative gain of the full model over the straw man:
 
 | Regime | `both` | `straw` | Relative gain |
 | --- | --- | --- | --- |
-| All | 0.7009 | 0.4876 | **+43.7%** |
-| A — cold start | 0.4353 | 0.1806 | **+141.1%** |
-| B — previous run succeeded | 0.1968 | 0.0496 | **+296.9%** |
-| C — previous run failed | 0.8944 | 0.6933 | +29.0% |
+| All | 0.7157 | 0.4886 | **+46.5%** |
+| A — cold start | 0.4793 | 0.1811 | **+164.7%** |
+| B — previous run succeeded | 0.2247 | 0.0493 | **+355.8%** |
+| C — previous run failed | 0.8987 | 0.6950 | +29.3% |
 
 ## Secondary metrics
 
 | Condition | Regime | ROC-AUC | MCC | Precision | Recall | F1 | Accuracy |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `static` | All | 0.6821 | 0.194 | 0.253 | 0.578 | 0.352 | 0.661 |
-| `hist` | All | 0.8628 | 0.556 | 0.690 | 0.555 | 0.615 | 0.890 |
-| `both` | All | 0.8890 | **0.565** | 0.636 | 0.632 | **0.634** | 0.884 |
-| `straw` | All | 0.8143 | 0.535 | 0.693 | 0.515 | 0.591 | **0.887** |
-| `static` | A | 0.6792 | 0.201 | 0.279 | 0.591 | 0.379 | 0.650 |
-| `both` | A | 0.7440 | 0.295 | 0.445 | 0.382 | 0.411 | 0.802 |
+| `static` | All | 0.7164 | 0.237 | 0.284 | 0.580 | 0.381 | 0.701 |
+| `hist` | All | 0.8690 | 0.563 | 0.689 | 0.568 | 0.623 | 0.891 |
+| `both` | All | 0.8982 | **0.584** | 0.661 | 0.637 | **0.649** | 0.891 |
+| `straw` | All | 0.8150 | 0.536 | 0.695 | 0.515 | 0.592 | 0.887 |
+| `static` | A | 0.7191 | 0.249 | 0.312 | 0.601 | 0.411 | 0.688 |
+| `hist` | A | 0.6720 | 0.238 | 0.501 | 0.210 | 0.296 | 0.819 |
+| `both` | A | 0.7746 | 0.342 | 0.489 | 0.419 | 0.451 | 0.815 |
 | `straw` | A | 0.5000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.819 |
-| `static` | B | 0.7001 | 0.133 | 0.092 | 0.590 | 0.159 | 0.690 |
-| `both` | B | 0.7825 | 0.153 | 0.370 | 0.080 | 0.131 | 0.948 |
-| `straw` | B | 0.5000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.950 |
-| `static` | C | 0.5266 | 0.026 | 0.704 | 0.567 | 0.628 | 0.534 |
-| `both` | C | 0.7932 | 0.235 | 0.719 | 0.982 | 0.830 | 0.721 |
+| `static` | B | 0.7209 | 0.149 | 0.102 | 0.562 | 0.173 | 0.735 |
+| `hist` | B | 0.7181 | 0.100 | 0.423 | 0.029 | 0.054 | 0.950 |
+| `both` | B | 0.8027 | 0.180 | 0.432 | 0.090 | 0.149 | 0.949 |
+| `straw` | B | 0.5000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.951 |
+| `static` | C | 0.5470 | 0.059 | 0.719 | 0.575 | 0.639 | 0.548 |
+| `both` | C | 0.7992 | 0.299 | 0.738 | 0.967 | 0.837 | 0.739 |
 
 ## Findings
 
