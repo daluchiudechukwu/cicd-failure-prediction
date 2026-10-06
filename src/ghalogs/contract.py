@@ -17,7 +17,10 @@ Three mechanisms, in increasing strength:
    including the two GitHub Actions-specific mechanisms described in the
    contract: log-derived workflow structure (truncated by fail-fast, so it
    encodes the outcome) and crawl-time repository counters (which post-date
-   most runs).
+   most runs). Denial is by substring, which over-matches: a *lagged*
+   post-execution field describes an earlier run and is legitimately
+   observable at prediction time. Those are admitted through a named
+   exemption list, never by renaming the column to evade the filter.
 
 3. **Statistical screening.** Any single feature whose univariate ROC-AUC
    against the label exceeds a threshold is flagged. This catches leaks that
@@ -103,6 +106,39 @@ FORBIDDEN_SUBSTRINGS: dict[str, str] = {
     "regime": "derived from the label of the preceding run",
 }
 
+# Prefixes that mark a feature as describing a strictly earlier run rather than
+# the run being predicted. An exemption below is only honoured for a name
+# carrying one of these, so the lag is always visible in the column name.
+LAG_PREFIXES: tuple[str, ...] = ("hist_prev", "hist_prior")
+
+# Features that contain a forbidden substring yet are admissible, because they
+# describe a run that had *already completed* when the target run was
+# triggered.
+#
+# This closes a gap in the substring denial above. "Duration" is forbidden
+# because a run's own duration is execution-dependent; the duration of the
+# preceding run is a different quantity, observable at prediction time, and
+# exactly the signal an early-warning framing rests on. A substring match
+# cannot tell the two apart, so the distinction is made explicitly here rather
+# than by picking a column name that slips past the filter.
+#
+# Admissibility depends on a gate, not just on a name: `precursor.py` blanks
+# every one of these when the predecessor had not finished before the target
+# run's `created_at`, and `assert_precursor_is_observable` checks the
+# invariant. Without that gate these would be future information.
+LAGGED_FIELD_EXEMPTIONS: dict[str, str] = {
+    "hist_prev_duration_sec": "duration of the preceding run, gated on it having "
+    "completed before this run was triggered",
+    "hist_prev_duration_log": "log1p of the same gated quantity",
+    "hist_prev2_duration_sec": "duration of the run two positions earlier, same gate",
+    "hist_prev_duration_ratio": "preceding duration over the mean of the ones before "
+    "it; the degradation-trend signal",
+    "hist_prior_duration_mean": "expanding mean of durations strictly earlier than "
+    "the preceding run",
+    "hist_prior_duration_slope": "least-squares slope over up to four earlier "
+    "durations, all completed before the trigger",
+}
+
 # Univariate ROC-AUC above which a feature is flagged for manual review.
 SINGLE_FEATURE_AUC_LIMIT = 0.95
 
@@ -126,6 +162,12 @@ class ContractReport:
         static = sum(1 for c in self.feature_columns if c.startswith("static_"))
         history = sum(1 for c in self.feature_columns if c.startswith("hist_"))
         lines.append(f"  static_*: {static}   hist_*: {history}")
+        lagged = [c for c in self.feature_columns if _is_exempt_lagged_field(c)]
+        if lagged:
+            lines.append(
+                f"  lagged-field exemptions in use: {len(lagged)} "
+                f"({', '.join(sorted(lagged))})"
+            )
         if self.flagged:
             lines.append(f"  FLAGGED by the AUC screen (limit {SINGLE_FEATURE_AUC_LIMIT}):")
             for name, auc in sorted(self.flagged.items(), key=lambda kv: -kv[1]):
@@ -133,6 +175,17 @@ class ContractReport:
         else:
             lines.append("  no feature exceeds the univariate AUC screen")
         return "\n".join(lines)
+
+
+def _is_exempt_lagged_field(column: str) -> bool:
+    """Is `column` an explicitly justified lagged field?
+
+    Both conditions are required: a recorded justification *and* a name that
+    advertises the lag. Either alone is too easy to satisfy by accident — a
+    bare exemption list would let `hist_duration_sec` through on a typo, and a
+    bare prefix rule would exempt anything merely named `hist_prev_*`.
+    """
+    return column in LAGGED_FIELD_EXEMPTIONS and column.startswith(LAG_PREFIXES)
 
 
 def select_features(frame: pd.DataFrame) -> list[str]:
@@ -164,7 +217,7 @@ def select_features(frame: pd.DataFrame) -> list[str]:
         column: reason
         for column in features
         for substring, reason in FORBIDDEN_SUBSTRINGS.items()
-        if substring in column
+        if substring in column and not _is_exempt_lagged_field(column)
     }
     if violations:
         raise ValueError(
