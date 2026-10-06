@@ -24,7 +24,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ghalogs import contract, history, quality, textproc  # noqa: E402
+from ghalogs import contract, history, precursor, quality, textproc  # noqa: E402
 from ghalogs.config import FAILURE_LABEL, FilterConfig  # noqa: E402
 
 BASE = datetime(2023, 9, 1, tzinfo=timezone.utc)
@@ -420,6 +420,302 @@ def test_commit_group_annotation_detects_mixed_outcomes():
     # One of the two runs on s1 is necessarily misclassified by any model that
     # sees only commit-level information.
     assert annotated["commit_group_minority"].tolist() == [1, 1, 0]
+
+
+def make_timed_runs(rows: list[dict]) -> pd.DataFrame:
+    """Build a runs frame carrying the completion timestamps precursors need.
+
+    Separate from `make_runs` because the precursor features turn on the
+    relationship between one run's completion and the next run's trigger, so
+    every test here has to state both explicitly.
+    """
+    defaults = {
+        "repo": "o/r",
+        "workflow_path": "ci.yml",
+        "run_attempt": 1,
+        "actor_login": "alice",
+        "head_branch": "main",
+        "head_sha": "abc123",
+        "audit_total_logs_size": 1000,
+    }
+    records = []
+    for index, row in enumerate(rows):
+        record = dict(defaults)
+        record.update(row)
+        record.setdefault("run_number", index + 1)
+        record.setdefault("created_at", BASE + timedelta(hours=index))
+        record.setdefault("audit_updated_at", record["created_at"] + timedelta(minutes=10))
+        record.setdefault("run_id", f"run-{index}")
+        records.append(record)
+    frame = pd.DataFrame(records)
+    frame[FAILURE_LABEL] = frame[FAILURE_LABEL].astype("int8")
+    for column in ("created_at", "audit_updated_at"):
+        frame[column] = pd.to_datetime(frame[column], utc=True)
+    return frame
+
+
+def precursor_by_run(frame: pd.DataFrame) -> pd.DataFrame:
+    return precursor.build_precursor_features(frame).set_index("run_id")
+
+
+# ---------------------------------------------------------------------------
+# Lagged-field exemptions in the contract
+# ---------------------------------------------------------------------------
+
+
+def test_contract_admits_a_justified_lagged_field():
+    """A predecessor's duration was observable at prediction time.
+
+    The substring denial cannot tell it apart from the run's own duration, so
+    the exemption list has to carry the distinction.
+    """
+    frame = base_feature_frame()
+    frame["hist_prev_duration_sec"] = 42.0
+    report = contract.enforce(frame)
+    assert "hist_prev_duration_sec" in report.feature_columns
+    assert "lagged-field exemptions in use: 1" in report.describe()
+
+
+def test_contract_refuses_a_lagged_name_without_a_recorded_justification():
+    """Naming a column `hist_prev_*` must not be enough to admit it.
+
+    Otherwise the exemption degenerates into a naming convention that anyone
+    can satisfy by accident.
+    """
+    frame = base_feature_frame()
+    frame["hist_prev_duration_unlisted"] = 1.0
+    with pytest.raises(ValueError, match="forbidden fields"):
+        contract.enforce(frame)
+
+
+def test_contract_refuses_an_exempt_name_that_does_not_advertise_the_lag(monkeypatch):
+    """The justification alone is not enough either; the name must show the lag.
+
+    Guards against a typo in the exemption list silently admitting a field that
+    describes the run being predicted.
+    """
+    monkeypatch.setitem(
+        contract.LAGGED_FIELD_EXEMPTIONS, "static_duration_sec", "typo in the list"
+    )
+    frame = base_feature_frame()
+    frame["static_duration_sec"] = 1.0
+    with pytest.raises(ValueError, match="forbidden fields"):
+        contract.enforce(frame)
+
+
+# ---------------------------------------------------------------------------
+# Precursor observability
+# ---------------------------------------------------------------------------
+
+
+def test_in_flight_predecessor_is_not_observable():
+    """The previous run is often still running when the next one is triggered.
+
+    This is the mechanism the baseline history features miss: `hist_prev_failed`
+    reports an outcome that did not exist at prediction time. Here run 1 is
+    still executing an hour after run 2 was queued.
+    """
+    frame = make_timed_runs(
+        [
+            {
+                "run_number": 1,
+                "created_at": BASE,
+                "audit_updated_at": BASE + timedelta(hours=2),
+                FAILURE_LABEL: 1,
+            },
+            {
+                "run_number": 2,
+                "created_at": BASE + timedelta(hours=1),
+                "audit_updated_at": BASE + timedelta(hours=3),
+                FAILURE_LABEL: 0,
+            },
+        ]
+    )
+    result = precursor_by_run(frame)
+    second = result.loc["run-1"]
+    assert second["hist_prev_completed_before_trigger"] == 0
+    assert second["hist_prev_failed_observable"] == -1
+    assert second["hist_prev_duration_sec"] == -1
+
+    # The baseline history feature, by contrast, happily reports the outcome.
+    leaky = history.build_history_features(frame).set_index("run_id")
+    assert leaky.loc["run-1", "hist_prev_failed"] == 1
+
+
+def test_completed_predecessor_yields_its_duration():
+    frame = make_timed_runs(
+        [
+            {
+                "run_number": 1,
+                "created_at": BASE,
+                "audit_updated_at": BASE + timedelta(minutes=10),
+                FAILURE_LABEL: 1,
+            },
+            {
+                "run_number": 2,
+                "created_at": BASE + timedelta(hours=1),
+                FAILURE_LABEL: 0,
+            },
+        ]
+    )
+    result = precursor_by_run(frame)
+    second = result.loc["run-1"]
+    assert second["hist_prev_completed_before_trigger"] == 1
+    assert second["hist_prev_failed_observable"] == 1
+    assert second["hist_prev_duration_sec"] == pytest.approx(600.0)
+
+
+def test_duration_window_excludes_an_unfinished_earlier_run():
+    """Per-element gating, not a gate on the immediate predecessor alone.
+
+    Runs finish out of order: run 2 is a long one still executing, while run 1
+    finished quickly. Run 3 therefore has no observable *immediate*
+    predecessor, but one observable earlier run, so the window aggregate exists
+    while the immediate-predecessor features do not. An `expanding()` window
+    could not express this and would include the unfinished run.
+    """
+    frame = make_timed_runs(
+        [
+            {
+                "run_number": 1,
+                "created_at": BASE,
+                "audit_updated_at": BASE + timedelta(minutes=30),
+                FAILURE_LABEL: 0,
+            },
+            {
+                "run_number": 2,
+                "created_at": BASE + timedelta(minutes=10),
+                "audit_updated_at": BASE + timedelta(hours=5),
+                FAILURE_LABEL: 0,
+            },
+            {
+                "run_number": 3,
+                "created_at": BASE + timedelta(hours=1),
+                FAILURE_LABEL: 1,
+            },
+        ]
+    )
+    third = precursor_by_run(frame).loc["run-2"]
+    assert third["hist_prev_completed_before_trigger"] == 0
+    assert third["hist_prev_duration_sec"] == -1
+    assert third["hist_prior_duration_mean"] == pytest.approx(1800.0)
+
+
+def test_observability_assertion_catches_an_ungated_lagged_value():
+    """Simulate a missed `.where(observable)` and confirm the guard fires."""
+    frame = make_timed_runs(
+        [
+            {
+                "run_number": 1,
+                "created_at": BASE,
+                "audit_updated_at": BASE + timedelta(hours=2),
+                FAILURE_LABEL: 1,
+            },
+            {
+                "run_number": 2,
+                "created_at": BASE + timedelta(hours=1),
+                FAILURE_LABEL: 0,
+            },
+        ]
+    )
+    result = precursor.build_precursor_features(frame)
+    precursor.assert_precursor_is_observable(result)
+
+    result.loc[result["hist_prev_completed_before_trigger"] == 0, "hist_prev_duration_sec"] = 99.0
+    with pytest.raises(AssertionError, match="no predecessor had completed"):
+        precursor.assert_precursor_is_observable(result)
+
+
+def test_observable_history_blanks_an_in_flight_predecessor():
+    frame = make_timed_runs(
+        [
+            {
+                "run_number": 1,
+                "created_at": BASE,
+                "audit_updated_at": BASE + timedelta(hours=2),
+                FAILURE_LABEL: 1,
+            },
+            {
+                "run_number": 2,
+                "created_at": BASE + timedelta(hours=1),
+                FAILURE_LABEL: 0,
+            },
+        ]
+    )
+    features = history.build_history_features(frame)
+    pre = precursor.build_precursor_features(frame)
+    honest = precursor.build_observable_history(features, pre).set_index("run_id")
+
+    assert honest.loc["run-1", "hist_prev_failed"] == -1
+    assert honest.loc["run-1", "hist_has_prev_run"] == 0
+    assert honest.loc["run-1", "hist_prev_failure_streak"] == 0
+
+
+def test_repository_window_counts_only_runs_that_had_finished():
+    """A run still in flight has told the developer nothing yet.
+
+    Workflow `c` starts before the target but finishes long after it, so it
+    must not appear in the target's 24-hour window even though it started
+    earlier.
+    """
+    frame = make_timed_runs(
+        [
+            {
+                "workflow_path": "a.yml",
+                "run_number": 1,
+                "created_at": BASE,
+                "audit_updated_at": BASE + timedelta(minutes=10),
+                FAILURE_LABEL: 1,
+            },
+            {
+                "workflow_path": "c.yml",
+                "run_number": 1,
+                "created_at": BASE + timedelta(minutes=30),
+                "audit_updated_at": BASE + timedelta(hours=5),
+                FAILURE_LABEL: 1,
+            },
+            {
+                "workflow_path": "b.yml",
+                "run_number": 1,
+                "created_at": BASE + timedelta(hours=1),
+                FAILURE_LABEL: 0,
+            },
+        ]
+    )
+    result = precursor_by_run(frame)
+    target = result.loc["run-2"]
+    assert target["hist_repo_runs_prev_24h"] == 1
+    assert target["hist_repo_failures_prev_24h"] == 1
+    assert target["hist_repo_failure_rate_prev_24h"] == pytest.approx(1.0)
+    # The newest completed run of another workflow failed, so the sibling
+    # signal fires.
+    assert target["hist_sibling_workflow_failed"] == 1
+
+    # The first run in the repository has no completed predecessor at all.
+    first = result.loc["run-0"]
+    assert first["hist_repo_runs_prev_24h"] == 0
+    assert first["hist_sibling_workflow_failed"] == -1
+
+
+def test_adjacent_depth_resets_on_a_run_number_gap():
+    """Depth measures the unbroken chain, which the five-run cap keeps short."""
+    frame = make_timed_runs(
+        [
+            {"run_number": 1, FAILURE_LABEL: 0},
+            {"run_number": 2, FAILURE_LABEL: 0},
+            {"run_number": 3, FAILURE_LABEL: 0},
+            {"run_number": 10, FAILURE_LABEL: 0},
+        ]
+    )
+    result = precursor_by_run(frame)
+    assert result["hist_adjacent_depth"].tolist() == [0, 1, 2, 0]
+
+
+def test_precursor_requires_the_audit_columns():
+    """Fail with a clear message rather than a KeyError deep in the pass."""
+    frame = make_timed_runs([{FAILURE_LABEL: 0}]).drop(columns=["audit_updated_at"])
+    with pytest.raises(ValueError, match="absent columns"):
+        precursor.build_precursor_features(frame)
 
 
 def test_identifier_columns_are_redacted_for_addresses_only():

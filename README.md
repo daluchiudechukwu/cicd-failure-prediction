@@ -48,6 +48,33 @@ cannot separate nearly half the positive class — workflow identity is a
 required input, and any commit-level model has an irreducible error floor of
 6.42%.
 
+## What the failures do not have: precursors
+
+Failures were also tested for the leading indicators an AIOps framing assumes.
+Nineteen precursor features covering duration drift, cadence change, failure
+bursts, cross-workflow cascades, and prior re-runs raise regime-B PR-AUC from
+0.224 to 0.247 (bootstrap CI [+0.019, +0.027]) — real, but **every explicitly
+temporal signal sits at chance**: duration trend 0.505, sibling-workflow
+failure 0.504, 24-hour failure burst 0.502, previous-run re-run 0.501. The
+uplift comes from cross-sectional context — how long this workflow usually
+takes, whether the branch or author changed — not from a degradation
+trajectory.
+
+Two further measured constraints follow. The median prediction sees **two**
+prior runs of its workflow and eleven of its repository, because GHALogs keeps
+only five runs per workflow; 0.22% of runs have more than a thousand. And the
+median run finishes in **2.4 minutes**, so warning about it saves nothing —
+although failed runs consume 51.2% of all CI minutes, so the value is
+concentrated in a long tail and any cost case has to be conditioned on
+expected duration.
+
+Testing this also surfaced a fourth leakage mechanism. CI is concurrent, so
+for **10.1% of runs the previous run was still executing** when the next was
+triggered — its outcome did not exist at prediction time. Held to outcomes it
+could actually have seen, the previous-outcome heuristic loses 11.0% of its
+pooled PR-AUC and drops below the base rate in the still-broken regime. See
+[`docs/07-early-warning-and-actionability.md`](docs/07-early-warning-and-actionability.md).
+
 ## Approach
 
 Unstructured trigger-time artefacts — commit messages, branch names, run
@@ -82,6 +109,7 @@ evidence instead of preference.
 | [`docs/04-execution-plan.md`](docs/04-execution-plan.md) | Eight phases with exit gates, model selection, evaluation protocol, explainability study, risk register, and chapter mapping |
 | [`docs/05-feasibility-results.md`](docs/05-feasibility-results.md) | A real experiment on all 573,993 runs establishing that pre-execution prediction works, and the bar the deep models must clear |
 | [`docs/06-data-pipeline.md`](docs/06-data-pipeline.md) | The ingestion, filtering, and feature-engineering pipeline, with the rationale behind each design decision |
+| [`docs/07-early-warning-and-actionability.md`](docs/07-early-warning-and-actionability.md) | Whether failures have temporal precursors, how much history a prediction actually sees, what operating points are achievable, and a fourth leakage mechanism |
 
 ## Running the pipeline
 
@@ -105,6 +133,10 @@ python scripts/audit_pipeline_output.py --features data/features.parquet
 
 # Feasibility experiment
 python scripts/run_baseline_experiment.py --features data/features.parquet
+
+# Early warning signals, predecessor observability, and operating points
+python scripts/run_early_warning_experiment.py \
+    --features data/features.parquet --runs data/runs_clean.parquet
 
 python -m pytest tests/ -q
 ```
